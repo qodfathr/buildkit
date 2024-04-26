@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/labels"
@@ -444,17 +445,91 @@ func (s3Client *s3Client) exists(ctx context.Context, key string) (*time.Time, e
 
 func (s3Client *s3Client) touch(ctx context.Context, key string) error {
 	copySource := fmt.Sprintf("%s/%s", s3Client.bucket, key)
-	cp := &s3.CopyObjectInput{
-		Bucket:            &s3Client.bucket,
-		CopySource:        &copySource,
-		Key:               &key,
-		Metadata:          map[string]string{"updated-at": time.Now().String()},
-		MetadataDirective: "REPLACE",
+
+	// Get object size
+	head, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: &s3Client.bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		var nfe *types.NoSuchKey
+		if errors.As(err, &nfe) {
+			return fmt.Errorf("object %s does not exist: %w", key, err)
+		}
+		return fmt.Errorf("failed to get object %s: %w", key, err)
 	}
 
-	_, err := s3Client.CopyObject(ctx, cp)
+	size := *head.ContentLength
 
-	return err
+	if size <= 5*1024*1024*1024 {
+		// If size is less than or equal to 5GB, use CopyObject
+		cp := &s3.CopyObjectInput{
+			Bucket:            &s3Client.bucket,
+			CopySource:        &copySource,
+			Key:               &key,
+			Metadata:          map[string]string{"updated-at": time.Now().String()},
+			MetadataDirective: "REPLACE",
+		}
+
+		_, err := s3Client.CopyObject(ctx, cp)
+		return err
+	} else {
+		// If size is greater than 5GB, use multipart upload
+		// Initiate multipart upload
+		createOut, err := s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket:   &s3Client.bucket,
+			Key:      &key,
+			Metadata: map[string]string{"updated-at": time.Now().String()},
+		})
+		if err != nil {
+			return err
+		}
+
+		// Create a slice to hold the completed parts
+		completedParts := []s3types.CompletedPart{}
+
+		// Copy parts
+		partSize := int64(5 * 1024 * 1024) // 5MB per part
+		for i := int64(0); i < size; i += partSize {
+			lastByte := i + partSize - 1
+			if lastByte > size {
+				lastByte = size - 1
+			}
+
+			partNumber := int32(i/partSize + 1)
+			copySourceRange := fmt.Sprintf("bytes=%d-%d", i, lastByte)
+			uploadPartCopyOutput, err := s3Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+				Bucket:          &s3Client.bucket,
+				CopySource:      &copySource,
+				Key:             &key,
+				PartNumber:      &partNumber,
+				UploadId:        createOut.UploadId,
+				CopySourceRange: &copySourceRange,
+			})
+			if err != nil {
+				return err
+			}
+			completedParts = append(completedParts, s3types.CompletedPart{
+				ETag:       uploadPartCopyOutput.CopyPartResult.ETag,
+				PartNumber: &partNumber,
+			})
+		}
+
+		// Complete multipart upload
+		_, err = s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:   &s3Client.bucket,
+			Key:      &key,
+			UploadId: createOut.UploadId,
+			MultipartUpload: &s3types.CompletedMultipartUpload{
+				Parts: completedParts,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to complete multipart upload for object %s: %w", key, err)
+		}
+
+		return nil
+	}
 }
 
 func (s3Client *s3Client) ReaderAt(ctx context.Context, desc ocispecs.Descriptor) (content.ReaderAt, error) {
