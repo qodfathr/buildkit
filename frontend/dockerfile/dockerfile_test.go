@@ -211,7 +211,7 @@ func init() {
 	frontends := map[string]interface{}{}
 
 	opts = []integration.TestOpt{
-		integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
+		integration.WithMirroredImages(integration.OfficialImages("busybox:latest", "alpine:latest")),
 		integration.WithMatrix("frontend", frontends),
 	}
 
@@ -252,7 +252,7 @@ func TestIntegration(t *testing.T) {
 	integration.Run(t, reproTests, append(opts,
 		// Only use the amd64 digest,  regardless to the host platform
 		integration.WithMirroredImages(map[string]string{
-			"amd64/bullseye-20230109-slim": "docker.io/amd64/debian:bullseye-20230109-slim@sha256:1acb06a0c31fb467eb8327ad361f1091ab265e0bf26d452dea45dcb0c0ea5e75",
+			"amd64/bullseye-20230109-slim:latest": "docker.io/amd64/debian:bullseye-20230109-slim@sha256:1acb06a0c31fb467eb8327ad361f1091ab265e0bf26d452dea45dcb0c0ea5e75",
 		}),
 	)...)
 }
@@ -3548,7 +3548,7 @@ COPY --from=build foo bar2
 	)
 	require.NoError(t, err)
 
-	server := httptest.NewServer(http.FileServer(http.Dir(filepath.Join(gitDir))))
+	server := httptest.NewServer(http.FileServer(http.Dir(filepath.Clean(gitDir))))
 	defer server.Close()
 
 	destDir := t.TempDir()

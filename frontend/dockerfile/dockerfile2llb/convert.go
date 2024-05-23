@@ -118,8 +118,17 @@ func DockerfileLint(ctx context.Context, dt []byte, opt ConvertOpt) (*lint.LintR
 		results.AddWarning(rulename, description, url, fmtmsg, sourceIndex, location)
 	}
 	_, err := toDispatchState(ctx, dt, opt)
+
+	var errLoc *parser.ErrorLocation
 	if err != nil {
-		return nil, err
+		buildErr := &lint.BuildError{
+			Message: err.Error(),
+		}
+		if errors.As(err, &errLoc) {
+			ranges := mergeLocations(errLoc.Locations...)
+			buildErr.Location = toPBLocation(sourceIndex, ranges)
+		}
+		results.Error = buildErr
 	}
 	return results, nil
 }
@@ -217,6 +226,7 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 	if err != nil {
 		return nil, err
 	}
+	validateStageNames(stages, opt.Warn)
 
 	shlex := shell.NewLex(dockerfile.EscapeToken)
 	outline := newOutlineCapture()
@@ -226,7 +236,9 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 			info := argInfo{definition: metaArg, location: cmd.Location()}
 			if v, ok := opt.BuildArgs[metaArg.Key]; !ok {
 				if metaArg.Value != nil {
-					*metaArg.Value, info.deps, _ = shlex.ProcessWordWithMatches(*metaArg.Value, metaArgsToMap(optMetaArgs))
+					result, _ := shlex.ProcessWordWithMatches(*metaArg.Value, metaArgsToMap(optMetaArgs))
+					*metaArg.Value = result.Result
+					info.deps = result.Matched
 				}
 			} else {
 				metaArg.Value = &v
@@ -248,14 +260,17 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 
 	// set base state for every image
 	for i, st := range stages {
-		name, used, err := shlex.ProcessWordWithMatches(st.BaseName, metaArgsToMap(optMetaArgs))
+		nameMatch, err := shlex.ProcessWordWithMatches(st.BaseName, metaArgsToMap(optMetaArgs))
+		reportUnusedFromArgs(nameMatch.Unmatched, st.Location, opt.Warn)
+		used := nameMatch.Matched
+
 		if err != nil {
 			return nil, parser.WithLocation(err, st.Location)
 		}
-		if name == "" {
+		if nameMatch.Result == "" {
 			return nil, parser.WithLocation(errors.Errorf("base name (%s) should not be blank", st.BaseName), st.Location)
 		}
-		st.BaseName = name
+		st.BaseName = nameMatch.Result
 
 		ds := &dispatchState{
 			stage:          st,
@@ -269,18 +284,22 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 		}
 
 		if v := st.Platform; v != "" {
-			v, u, err := shlex.ProcessWordWithMatches(v, metaArgsToMap(optMetaArgs))
+			platMatch, err := shlex.ProcessWordWithMatches(v, metaArgsToMap(optMetaArgs))
+			reportUnusedFromArgs(platMatch.Unmatched, st.Location, opt.Warn)
+
 			if err != nil {
-				return nil, parser.WithLocation(errors.Wrapf(err, "failed to process arguments for platform %s", v), st.Location)
+				return nil, parser.WithLocation(errors.Wrapf(err, "failed to process arguments for platform %s", platMatch.Result), st.Location)
 			}
 
-			p, err := platforms.Parse(v)
+			p, err := platforms.Parse(platMatch.Result)
 			if err != nil {
-				return nil, parser.WithLocation(errors.Wrapf(err, "failed to parse platform %s", v), st.Location)
+				return nil, parser.WithLocation(errors.Wrapf(err, "failed to parse platform %s", platMatch.Result), st.Location)
 			}
-			for k := range u {
+
+			for k := range platMatch.Matched {
 				used[k] = struct{}{}
 			}
+
 			ds.platform = &p
 		}
 
@@ -530,18 +549,7 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 		if !isReachable(target, d) || d.noinit {
 			continue
 		}
-		// mark as initialized, used to determine states that have not been dispatched yet
-		d.noinit = true
-
-		if d.base != nil {
-			d.state = d.base.state
-			d.platform = d.base.platform
-			d.image = clone(d.base.image)
-			d.baseImg = cloneX(d.base.baseImg)
-			// Utilize the same path index as our base image so we propagate
-			// the paths we use back to the base image.
-			d.paths = d.base.paths
-		}
+		d.init()
 
 		// Ensure platform is set.
 		if d.platform == nil {
@@ -592,6 +600,7 @@ func toDispatchState(ctx context.Context, dt []byte, opt ConvertOpt) (*dispatchS
 			cgroupParent:      opt.CgroupParent,
 			llbCaps:           opt.LLBCaps,
 			sourceMap:         opt.SourceMap,
+			lintWarn:          opt.Warn,
 		}
 
 		if err = dispatchOnBuildTriggers(d, d.image.Config.OnBuild, opt); err != nil {
@@ -727,16 +736,21 @@ type dispatchOpt struct {
 	cgroupParent      string
 	llbCaps           *apicaps.CapSet
 	sourceMap         *llb.SourceMap
+	lintWarn          linter.LintWarnFunc
 }
 
 func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
+	var err error
 	if ex, ok := cmd.Command.(instructions.SupportsSingleWordExpansion); ok {
 		err := ex.Expand(func(word string) (string, error) {
 			env, err := d.state.Env(context.TODO())
 			if err != nil {
 				return "", err
 			}
-			return opt.shlex.ProcessWord(word, env)
+
+			newword, unmatched, err := opt.shlex.ProcessWord(word, env)
+			reportUnmatchedVariables(cmd, d.buildArgs, unmatched, &opt)
+			return newword, err
 		})
 		if err != nil {
 			return err
@@ -748,17 +762,17 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 			if err != nil {
 				return "", err
 			}
-
 			lex := shell.NewLex('\\')
 			lex.SkipProcessQuotes = true
-			return lex.ProcessWord(word, env)
+			newword, unmatched, err := lex.ProcessWord(word, env)
+			reportUnmatchedVariables(cmd, d.buildArgs, unmatched, &opt)
+			return newword, err
 		})
 		if err != nil {
 			return err
 		}
 	}
 
-	var err error
 	switch c := cmd.Command.(type) {
 	case *instructions.MaintainerCommand:
 		err = dispatchMaintainer(d, c)
@@ -801,11 +815,11 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 	case *instructions.OnbuildCommand:
 		err = dispatchOnbuild(d, c)
 	case *instructions.CmdCommand:
-		err = dispatchCmd(d, c)
+		err = dispatchCmd(d, c, opt.lintWarn)
 	case *instructions.EntrypointCommand:
-		err = dispatchEntrypoint(d, c)
+		err = dispatchEntrypoint(d, c, opt.lintWarn)
 	case *instructions.HealthCheckCommand:
-		err = dispatchHealthcheck(d, c)
+		err = dispatchHealthcheck(d, c, opt.lintWarn)
 	case *instructions.ExposeCommand:
 		err = dispatchExpose(d, c, opt.shlex)
 	case *instructions.UserCommand:
@@ -817,7 +831,7 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 	case *instructions.ShellCommand:
 		err = dispatchShell(d, c)
 	case *instructions.ArgCommand:
-		err = dispatchArg(d, c, opt.metaArgs, opt.buildArgValues)
+		err = dispatchArg(d, c, &opt)
 	case *instructions.CopyCommand:
 		l := opt.buildContext
 		if len(cmd.sources) != 0 {
@@ -877,7 +891,6 @@ type dispatchState struct {
 	// paths marks the paths that are used by this dispatchState.
 	paths          map[string]struct{}
 	ignoreCache    bool
-	cmdSet         bool
 	unregistered   bool
 	stageName      string
 	cmdIndex       int
@@ -887,10 +900,37 @@ type dispatchState struct {
 	epoch          *time.Time
 	scanStage      bool
 	scanContext    bool
+	// workdirSet is set to true if a workdir has been set
+	// within the current dockerfile.
+	workdirSet bool
+
+	entrypoint  instructionTracker
+	cmd         instructionTracker
+	healthcheck instructionTracker
 }
 
 func (ds *dispatchState) asyncLocalOpts() []llb.LocalOption {
 	return filterPaths(ds.paths)
+}
+
+// init is invoked when the dispatch state inherits its attributes
+// from the base image.
+func (ds *dispatchState) init() {
+	// mark as initialized, used to determine states that have not been dispatched yet
+	ds.noinit = true
+
+	if ds.base == nil {
+		return
+	}
+
+	ds.state = ds.base.state
+	ds.platform = ds.base.platform
+	ds.image = clone(ds.base.image)
+	ds.baseImg = cloneX(ds.base.baseImg)
+	// Utilize the same path index as our base image so we propagate
+	// the paths we use back to the base image.
+	ds.paths = ds.base.paths
+	ds.workdirSet = ds.base.workdirSet
 }
 
 type dispatchStates struct {
@@ -1032,6 +1072,8 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 		}
 	}
 	if c.PrependShell {
+		// Don't pass the linter function because we do not report a warning for
+		// shell usage on run commands.
 		args = withShell(d.image, args)
 	}
 
@@ -1105,6 +1147,23 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 }
 
 func dispatchWorkdir(d *dispatchState, c *instructions.WorkdirCommand, commit bool, opt *dispatchOpt) error {
+	if commit {
+		// This linter rule checks if workdir has been set to an absolute value locally
+		// within the current dockerfile. Absolute paths in base images are ignored
+		// because they might change and it is not advised to rely on them.
+		//
+		// We only run this check when commit is true. Commit is true when we are performing
+		// this operation on a local call to workdir rather than one coming from
+		// the base image. We only check the first instance of workdir being set
+		// so successive relative paths are ignored because every instance is fixed
+		// by fixing the first one.
+		if !d.workdirSet && !system.IsAbs(c.Path, d.platform.OS) {
+			msg := linter.RuleWorkdirRelativePath.Format(c.Path)
+			linter.RuleWorkdirRelativePath.Run(opt.lintWarn, c.Location(), msg)
+		}
+		d.workdirSet = true
+	}
+
 	wd, err := system.NormalizeWorkdir(d.image.Config.WorkingDir, c.Path, d.platform.OS)
 	if err != nil {
 		return errors.Wrap(err, "normalizing workdir")
@@ -1416,30 +1475,42 @@ func dispatchOnbuild(d *dispatchState, c *instructions.OnbuildCommand) error {
 	return nil
 }
 
-func dispatchCmd(d *dispatchState, c *instructions.CmdCommand) error {
+func dispatchCmd(d *dispatchState, c *instructions.CmdCommand, warn linter.LintWarnFunc) error {
+	validateUsedOnce(c, &d.cmd, warn)
+
 	var args []string = c.CmdLine
 	if c.PrependShell {
+		if len(d.image.Config.Shell) == 0 {
+			msg := linter.RuleJSONArgsRecommended.Format(c.Name())
+			linter.RuleJSONArgsRecommended.Run(warn, c.Location(), msg)
+		}
 		args = withShell(d.image, args)
 	}
 	d.image.Config.Cmd = args
 	d.image.Config.ArgsEscaped = true //nolint:staticcheck // ignore SA1019: field is deprecated in OCI Image spec, but used for backward-compatibility with Docker image spec.
-	d.cmdSet = true
 	return commitToHistory(&d.image, fmt.Sprintf("CMD %q", args), false, nil, d.epoch)
 }
 
-func dispatchEntrypoint(d *dispatchState, c *instructions.EntrypointCommand) error {
+func dispatchEntrypoint(d *dispatchState, c *instructions.EntrypointCommand, warn linter.LintWarnFunc) error {
+	validateUsedOnce(c, &d.entrypoint, warn)
+
 	var args []string = c.CmdLine
 	if c.PrependShell {
+		if len(d.image.Config.Shell) == 0 {
+			msg := linter.RuleJSONArgsRecommended.Format(c.Name())
+			linter.RuleJSONArgsRecommended.Run(warn, c.Location(), msg)
+		}
 		args = withShell(d.image, args)
 	}
 	d.image.Config.Entrypoint = args
-	if !d.cmdSet {
+	if !d.cmd.IsSet {
 		d.image.Config.Cmd = nil
 	}
 	return commitToHistory(&d.image, fmt.Sprintf("ENTRYPOINT %q", args), false, nil, d.epoch)
 }
 
-func dispatchHealthcheck(d *dispatchState, c *instructions.HealthCheckCommand) error {
+func dispatchHealthcheck(d *dispatchState, c *instructions.HealthCheckCommand, warn linter.LintWarnFunc) error {
+	validateUsedOnce(c, &d.healthcheck, warn)
 	d.image.Config.Healthcheck = &dockerspec.HealthcheckConfig{
 		Test:          c.Health.Test,
 		Interval:      c.Health.Interval,
@@ -1516,10 +1587,10 @@ func dispatchShell(d *dispatchState, c *instructions.ShellCommand) error {
 	return commitToHistory(&d.image, fmt.Sprintf("SHELL %v", c.Shell), false, nil, d.epoch)
 }
 
-func dispatchArg(d *dispatchState, c *instructions.ArgCommand, metaArgs []instructions.KeyValuePairOptional, buildArgValues map[string]string) error {
+func dispatchArg(d *dispatchState, c *instructions.ArgCommand, opt *dispatchOpt) error {
 	commitStrs := make([]string, 0, len(c.Args))
 	for _, arg := range c.Args {
-		buildArg := setKVValue(arg, buildArgValues)
+		buildArg := setKVValue(arg, opt.buildArgValues)
 
 		commitStr := arg.Key
 		if arg.Value != nil {
@@ -1529,7 +1600,7 @@ func dispatchArg(d *dispatchState, c *instructions.ArgCommand, metaArgs []instru
 
 		skipArgInfo := false // skip the arg info if the arg is inherited from global scope
 		if buildArg.Value == nil {
-			for _, ma := range metaArgs {
+			for _, ma := range opt.metaArgs {
 				if ma.Key == buildArg.Key {
 					buildArg.Value = ma.Value
 					skipArgInfo = true
@@ -1816,7 +1887,7 @@ func uppercaseCmd(str string) string {
 }
 
 func processCmdEnv(shlex *shell.Lex, cmd string, env []string) string {
-	w, err := shlex.ProcessWord(cmd, env)
+	w, _, err := shlex.ProcessWord(cmd, env)
 	if err != nil {
 		return cmd
 	}
@@ -1990,4 +2061,120 @@ func validateCommandCasing(dockerfile *parser.Result, warn linter.LintWarnFunc) 
 			}
 		}
 	}
+}
+
+var reservedStageNames = map[string]struct{}{
+	"context": {},
+	"scratch": {},
+}
+
+func validateStageNames(stages []instructions.Stage, warn linter.LintWarnFunc) {
+	stageNames := make(map[string]struct{})
+	for _, stage := range stages {
+		if stage.Name != "" {
+			if _, ok := reservedStageNames[stage.Name]; ok {
+				msg := linter.RuleReservedStageName.Format(stage.Name)
+				linter.RuleReservedStageName.Run(warn, stage.Location, msg)
+			}
+
+			if _, ok := stageNames[stage.Name]; ok {
+				msg := linter.RuleDuplicateStageName.Format(stage.Name)
+				linter.RuleDuplicateStageName.Run(warn, stage.Location, msg)
+			}
+			stageNames[stage.Name] = struct{}{}
+		}
+	}
+}
+
+func reportUnmatchedVariables(cmd instructions.Command, buildArgs []instructions.KeyValuePairOptional, unmatched map[string]struct{}, opt *dispatchOpt) {
+	if len(unmatched) == 0 {
+		return
+	}
+	for _, buildArg := range buildArgs {
+		delete(unmatched, buildArg.Key)
+	}
+	for cmdVar := range unmatched {
+		_, nonEnvOk := nonEnvArgs[cmdVar]
+		if !nonEnvOk {
+			msg := linter.RuleUndefinedVar.Format(cmdVar)
+			linter.RuleUndefinedVar.Run(opt.lintWarn, cmd.Location(), msg)
+		}
+	}
+}
+
+func mergeLocations(locations ...[]parser.Range) []parser.Range {
+	allRanges := []parser.Range{}
+	for _, ranges := range locations {
+		allRanges = append(allRanges, ranges...)
+	}
+	if len(allRanges) == 0 {
+		return []parser.Range{}
+	}
+	if len(allRanges) == 1 {
+		return allRanges
+	}
+
+	sort.Slice(allRanges, func(i, j int) bool {
+		return allRanges[i].Start.Line < allRanges[j].Start.Line
+	})
+
+	location := []parser.Range{}
+	currentRange := allRanges[0]
+	for _, r := range allRanges[1:] {
+		if r.Start.Line <= currentRange.End.Line {
+			currentRange.End.Line = max(currentRange.End.Line, r.End.Line)
+		} else {
+			location = append(location, currentRange)
+			currentRange = r
+		}
+	}
+	location = append(location, currentRange)
+	return location
+}
+
+func toPBLocation(sourceIndex int, location []parser.Range) pb.Location {
+	loc := make([]*pb.Range, 0, len(location))
+	for _, l := range location {
+		loc = append(loc, &pb.Range{
+			Start: pb.Position{
+				Line:      int32(l.Start.Line),
+				Character: int32(l.Start.Character),
+			},
+			End: pb.Position{
+				Line:      int32(l.End.Line),
+				Character: int32(l.End.Character),
+			},
+		})
+	}
+	return pb.Location{
+		SourceIndex: int32(sourceIndex),
+		Ranges:      loc,
+	}
+}
+
+func reportUnusedFromArgs(unmatched map[string]struct{}, location []parser.Range, warn linter.LintWarnFunc) {
+	for arg := range unmatched {
+		msg := linter.RuleUndeclaredArgInFrom.Format(arg)
+		linter.RuleUndeclaredArgInFrom.Run(warn, location, msg)
+	}
+}
+
+type instructionTracker struct {
+	Loc   []parser.Range
+	IsSet bool
+}
+
+func (v *instructionTracker) MarkUsed(loc []parser.Range) {
+	v.Loc = loc
+	v.IsSet = true
+}
+
+func validateUsedOnce(c instructions.Command, loc *instructionTracker, warn linter.LintWarnFunc) {
+	if loc.IsSet {
+		msg := linter.RuleMultipleInstructionsDisallowed.Format(c.Name())
+		// Report the location of the previous invocation because it is the one
+		// that will be ignored.
+		linter.RuleMultipleInstructionsDisallowed.Run(warn, loc.Loc, msg)
+	}
+	loc.MarkUsed(c.Location())
 }
