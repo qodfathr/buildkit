@@ -15,11 +15,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/containerd/pkg/seed" //nolint:staticcheck // SA1019 deprecated
+	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/pkg/userns"
-	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/containerd/remotes/docker"
 	"github.com/containerd/containerd/sys"
+	"github.com/containerd/platforms"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/gofrs/flock"
@@ -80,8 +80,6 @@ func init() {
 	apicaps.ExportedProduct = "buildkit"
 	stack.SetVersionInfo(version.Version, version.Revision)
 
-	//nolint:staticcheck // SA1019 deprecated
-	seed.WithTimeAndRand()
 	if reexec.Init() {
 		os.Exit(0)
 	}
@@ -262,6 +260,12 @@ func main() {
 			logrus.SetLevel(logrus.TraceLevel)
 		}
 
+		if sc := cfg.System; sc != nil {
+			if v := sc.PlatformsCacheMaxAge; v != nil {
+				archutil.CacheMaxAge = v.Duration
+			}
+		}
+
 		if cfg.GRPC.DebugAddress != "" {
 			if err := setupDebugHandlers(cfg.GRPC.DebugAddress); err != nil {
 				return err
@@ -289,6 +293,8 @@ func main() {
 			grpc.StatsHandler(statsHandler),
 			grpc.ChainUnaryInterceptor(unaryInterceptor, grpcerrors.UnaryServerInterceptor),
 			grpc.StreamInterceptor(grpcerrors.StreamServerInterceptor),
+			grpc.MaxRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
+			grpc.MaxSendMsgSize(defaults.DefaultMaxSendMsgSize),
 		}
 		server := grpc.NewServer(opts...)
 

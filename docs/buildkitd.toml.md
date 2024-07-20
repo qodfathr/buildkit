@@ -104,6 +104,8 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
   # maintain a pool of reusable CNI network namespaces to amortize the overhead
   # of allocating and releasing the namespaces
   cniPoolSize = 16
+  # defaultCgroupParent sets the parent cgroup of all containers.
+  defaultCgroupParent = "buildkit"
 
   [worker.containerd.labels]
     "foo" = "bar"
@@ -139,18 +141,22 @@ insecure-entitlements = [ "network.host", "security.insecure" ]
 
 # Frontend control
 [frontend."dockerfile.v0"]
- enabled = true
+  enabled = true
 
 [frontend."gateway.v0"]
- enabled = true
+  enabled = true
 
- # If allowedRepositories is empty, all gateway sources are allowed.
- # Otherwise, only the listed repositories are allowed as a gateway source.
- # 
- # NOTE: Only the repository name (without tag) is compared.
- #
- # Example:
- # allowedRepositories = [ "docker-registry.wikimedia.org/repos/releng/blubber/buildkit" ]
- allowedRepositories = []
+  # If allowedRepositories is empty, all gateway sources are allowed.
+  # Otherwise, only the listed repositories are allowed as a gateway source.
+  # 
+  # NOTE: Only the repository name (without tag) is compared.
+  #
+  # Example:
+  # allowedRepositories = [ "docker-registry.wikimedia.org/repos/releng/blubber/buildkit" ]
+  allowedRepositories = []
+
+[system]
+  # how often buildkit scans for changes in the supported emulated platforms
+  platformsCacheMaxAge = "1h"
 
 ```

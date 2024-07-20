@@ -38,6 +38,14 @@ type Config struct {
 		Dockerfile DockerfileFrontendConfig `toml:"dockerfile.v0"`
 		Gateway    GatewayFrontendConfig    `toml:"gateway.v0"`
 	} `toml:"frontend"`
+
+	System *SystemConfig `toml:"system"`
+}
+
+type SystemConfig struct {
+	// PlatformCacheMaxAge controls how often supported platforms
+	// are refreshed by rescanning the system.
+	PlatformsCacheMaxAge *Duration `toml:"platformsCacheMaxAge"`
 }
 
 type LogConfig struct {
@@ -133,6 +141,8 @@ type ContainerdConfig struct {
 	SELinux bool `toml:"selinux"`
 
 	MaxParallelism int `toml:"max-parallelism"`
+
+	DefaultCgroupParent string `toml:"defaultCgroupParent"`
 
 	Rootless bool `toml:"rootless"`
 }

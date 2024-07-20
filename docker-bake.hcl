@@ -46,6 +46,11 @@ variable "GOLANGCI_LINT_MULTIPLATFORM" {
 variable "DESTDIR" {
   default = ""
 }
+
+variable "TEST_COVERAGE" {
+  default = null
+}
+
 function "bindir" {
   params = [defaultdir]
   result = DESTDIR != "" ? DESTDIR : "./bin/${defaultdir}"
@@ -115,10 +120,13 @@ target "integration-tests-base" {
 target "integration-tests" {
   inherits = ["integration-tests-base"]
   target = "integration-tests"
+  args = {
+    GOBUILDFLAGS = TEST_COVERAGE == "1" ? "-cover" : null
+  }
 }
 
 group "validate" {
-  targets = ["lint", "validate-vendor", "validate-doctoc", "validate-generated-files", "validate-archutil", "validate-shfmt", "validate-docs"]
+  targets = ["lint", "validate-vendor", "validate-doctoc", "validate-generated-files", "validate-archutil", "validate-shfmt", "validate-docs", "validate-docs-dockerfile"]
 }
 
 target "lint" {
@@ -203,6 +211,13 @@ target "validate-docs" {
   output = ["type=cacheonly"]
 }
 
+target "validate-docs-dockerfile" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/docs-dockerfile.Dockerfile"
+  target = "validate"
+  output = ["type=cacheonly"]
+}
+
 target "vendor" {
   inherits = ["_common"]
   dockerfile = "./hack/dockerfiles/vendor.Dockerfile"
@@ -250,6 +265,13 @@ target "docs" {
   dockerfile = "./hack/dockerfiles/docs.Dockerfile"
   target = "update"
   output = ["./docs"]
+}
+
+target "docs-dockerfile" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/docs-dockerfile.Dockerfile"
+  target = "update"
+  output = ["./frontend/dockerfile/docs/rules"]
 }
 
 target "mod-outdated" {

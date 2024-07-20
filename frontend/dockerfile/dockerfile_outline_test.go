@@ -267,7 +267,7 @@ COPY Dockerfile Dockerfile
 		reqs, err := subrequests.Describe(ctx, c)
 		require.NoError(t, err)
 
-		require.True(t, len(reqs) > 0)
+		require.Greater(t, len(reqs), 0)
 
 		hasOutline := false
 
@@ -277,7 +277,7 @@ COPY Dockerfile Dockerfile
 			}
 			hasOutline = true
 			require.Equal(t, subrequests.RequestType("rpc"), req.Type)
-			require.NotEqual(t, req.Version, "")
+			require.NotEqual(t, "", req.Version)
 		}
 		require.True(t, hasOutline)
 

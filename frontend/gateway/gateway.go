@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/mount"
 	"github.com/distribution/reference"
 	"github.com/docker/docker/pkg/idtools"
@@ -153,8 +155,9 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 			return nil, err
 		}
 		defer func() {
+			ctx := context.WithoutCancel(ctx)
 			devRes.EachRef(func(ref solver.ResultProxy) error {
-				return ref.Release(context.TODO())
+				return ref.Release(ctx)
 			})
 		}()
 		if devRes.Ref == nil {
@@ -246,8 +249,9 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 			return nil, err
 		}
 		defer func() {
+			ctx := context.WithoutCancel(ctx)
 			res.EachRef(func(ref solver.ResultProxy) error {
-				return ref.Release(context.TODO())
+				return ref.Release(ctx)
 			})
 		}()
 		if res.Ref == nil {
@@ -324,11 +328,8 @@ func (gf *gatewayFrontend) Solve(ctx context.Context, llbBridge frontend.Fronten
 		}
 	}
 
-	lbf, ctx, err := serveLLBBridgeForwarder(ctx, llbBridge, exec, gf.workers, inputs, sid, sm)
-	defer lbf.conn.Close() //nolint
-	if err != nil {
-		return nil, err
-	}
+	lbf, ctx := serveLLBBridgeForwarder(ctx, llbBridge, exec, gf.workers, inputs, sid, sm)
+	defer lbf.conn.Close()
 	defer lbf.Discard()
 
 	mdmnt, release, err := metadataMount(frontendDef)
@@ -494,10 +495,16 @@ func newBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridg
 	return lbf
 }
 
-func serveLLBBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager) (*llbBridgeForwarder, context.Context, error) {
+func serveLLBBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLBBridge, exec executor.Executor, workers worker.Infos, inputs map[string]*opspb.Definition, sid string, sm *session.Manager) (*llbBridgeForwarder, context.Context) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	lbf := newBridgeForwarder(ctx, llbBridge, exec, workers, inputs, sid, sm)
-	server := grpc.NewServer(grpc.UnaryInterceptor(grpcerrors.UnaryServerInterceptor), grpc.StreamInterceptor(grpcerrors.StreamServerInterceptor))
+	serverOpt := []grpc.ServerOption{
+		grpc.UnaryInterceptor(grpcerrors.UnaryServerInterceptor),
+		grpc.StreamInterceptor(grpcerrors.StreamServerInterceptor),
+		grpc.MaxRecvMsgSize(defaults.DefaultMaxRecvMsgSize),
+		grpc.MaxSendMsgSize(defaults.DefaultMaxSendMsgSize),
+	}
+	server := grpc.NewServer(serverOpt...)
 	grpc_health_v1.RegisterHealthServer(server, health.NewServer())
 	pb.RegisterLLBBridgeServer(server, lbf)
 
@@ -511,7 +518,7 @@ func serveLLBBridgeForwarder(ctx context.Context, llbBridge frontend.FrontendLLB
 		cancel(errors.WithStack(context.Canceled))
 	}()
 
-	return lbf, ctx, nil
+	return lbf, ctx
 }
 
 type pipe struct {
@@ -852,10 +859,7 @@ func (lbf *llbBridgeForwarder) Solve(ctx context.Context, req *pb.SolveRequest) 
 		if err := json.Unmarshal(req.ExporterAttr, &exp); err != nil {
 			return nil, err
 		}
-
-		for k, v := range res.Metadata {
-			exp[k] = v
-		}
+		maps.Copy(exp, res.Metadata)
 
 		lbf.mu.Lock()
 		lbf.result = &frontend.Result{
@@ -1148,7 +1152,7 @@ func (lbf *llbBridgeForwarder) NewContainer(ctx context.Context, in *pb.NewConta
 	}
 	defer func() {
 		if err != nil {
-			ctr.Release(ctx) // ensure release on error
+			ctr.Release(context.WithoutCancel(ctx)) // ensure release on error
 		}
 	}()
 

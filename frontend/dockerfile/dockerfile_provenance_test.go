@@ -19,8 +19,8 @@ import (
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/content/proxy"
-	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/continuity/fs/fstest"
+	"github.com/containerd/platforms"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	provenanceCommon "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/common"
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -119,8 +119,8 @@ RUN echo "ok" > /foo
 
 			att := imgs.Find("unknown/unknown")
 			require.NotNil(t, att)
-			require.Equal(t, att.Desc.Annotations["vnd.docker.reference.digest"], string(img.Desc.Digest))
-			require.Equal(t, att.Desc.Annotations["vnd.docker.reference.type"], "attestation-manifest")
+			require.Equal(t, string(img.Desc.Digest), att.Desc.Annotations["vnd.docker.reference.digest"])
+			require.Equal(t, "attestation-manifest", att.Desc.Annotations["vnd.docker.reference.type"])
 			var attest intoto.Statement
 			require.NoError(t, json.Unmarshal(att.LayersRaw[0], &attest))
 			require.Equal(t, "https://in-toto.io/Statement/v0.1", attest.Type)
@@ -204,9 +204,9 @@ RUN echo "ok" > /foo
 			require.Equal(t, "dockerfile", pred.Invocation.Parameters.Locals[1].Name)
 
 			require.NotNil(t, pred.Metadata.BuildFinishedOn)
-			require.True(t, time.Since(*pred.Metadata.BuildFinishedOn) < 5*time.Minute)
+			require.Less(t, time.Since(*pred.Metadata.BuildFinishedOn), 5*time.Minute)
 			require.NotNil(t, pred.Metadata.BuildStartedOn)
-			require.True(t, time.Since(*pred.Metadata.BuildStartedOn) < 5*time.Minute)
+			require.Less(t, time.Since(*pred.Metadata.BuildStartedOn), 5*time.Minute)
 			require.True(t, pred.Metadata.BuildStartedOn.Before(*pred.Metadata.BuildFinishedOn))
 
 			require.True(t, pred.Metadata.Completeness.Environment)
@@ -316,8 +316,8 @@ COPY myapp.Dockerfile /
 
 	att := imgs.Find("unknown/unknown")
 	require.NotNil(t, att)
-	require.Equal(t, att.Desc.Annotations["vnd.docker.reference.digest"], string(img.Desc.Digest))
-	require.Equal(t, att.Desc.Annotations["vnd.docker.reference.type"], "attestation-manifest")
+	require.Equal(t, string(img.Desc.Digest), att.Desc.Annotations["vnd.docker.reference.digest"])
+	require.Equal(t, "attestation-manifest", att.Desc.Annotations["vnd.docker.reference.type"])
 	var attest intoto.Statement
 	require.NoError(t, json.Unmarshal(att.LayersRaw[0], &attest))
 	require.Equal(t, "https://in-toto.io/Statement/v0.1", attest.Type)
@@ -453,7 +453,7 @@ RUN echo "ok-$TARGETARCH" > /foo
 
 		att := imgs.FindAttestation(p)
 		require.NotNil(t, att)
-		require.Equal(t, att.Desc.Annotations["vnd.docker.reference.type"], "attestation-manifest")
+		require.Equal(t, "attestation-manifest", att.Desc.Annotations["vnd.docker.reference.type"])
 		var attest intoto.Statement
 		require.NoError(t, json.Unmarshal(att.LayersRaw[0], &attest))
 		require.Equal(t, "https://in-toto.io/Statement/v0.1", attest.Type)
@@ -635,7 +635,7 @@ func testClientFrontendProvenance(t *testing.T, sb integration.Sandbox) {
 
 	att := imgs.FindAttestation("linux/arm64")
 	require.NotNil(t, att)
-	require.Equal(t, att.Desc.Annotations["vnd.docker.reference.type"], "attestation-manifest")
+	require.Equal(t, "attestation-manifest", att.Desc.Annotations["vnd.docker.reference.type"])
 	var attest intoto.Statement
 	require.NoError(t, json.Unmarshal(att.LayersRaw[0], &attest))
 	require.Equal(t, "https://in-toto.io/Statement/v0.1", attest.Type)
@@ -668,7 +668,7 @@ func testClientFrontendProvenance(t *testing.T, sb integration.Sandbox) {
 
 	att = imgs.FindAttestation("linux/amd64")
 	require.NotNil(t, att)
-	require.Equal(t, att.Desc.Annotations["vnd.docker.reference.type"], "attestation-manifest")
+	require.Equal(t, "attestation-manifest", att.Desc.Annotations["vnd.docker.reference.type"])
 	attest = intoto.Statement{}
 	require.NoError(t, json.Unmarshal(att.LayersRaw[0], &attest))
 	require.Equal(t, "https://in-toto.io/Statement/v0.1", attest.Type)
@@ -781,7 +781,7 @@ func testClientLLBProvenance(t *testing.T, sb integration.Sandbox) {
 
 	att := imgs.FindAttestation(nativePlatform)
 	require.NotNil(t, att)
-	require.Equal(t, att.Desc.Annotations["vnd.docker.reference.type"], "attestation-manifest")
+	require.Equal(t, "attestation-manifest", att.Desc.Annotations["vnd.docker.reference.type"])
 	var attest intoto.Statement
 	require.NoError(t, json.Unmarshal(att.LayersRaw[0], &attest))
 	require.Equal(t, "https://in-toto.io/Statement/v0.1", attest.Type)
@@ -1369,6 +1369,7 @@ COPY bar bar2
 			break
 		}
 		require.Equal(t, ref, ev.Record.Ref)
+		require.Len(t, ev.Record.Exporters, 1)
 
 		for _, prov := range ev.Record.Result.Attestations {
 			if len(prov.Annotations) == 0 || prov.Annotations["in-toto.io/predicate-type"] != "https://slsa.dev/provenance/v0.2" {
@@ -1385,7 +1386,7 @@ COPY bar bar2
 		}
 	}
 
-	require.NotEqual(t, len(provDt), 0)
+	require.NotEqual(t, 0, len(provDt))
 
 	var pred provenancetypes.ProvenancePredicate
 	require.NoError(t, json.Unmarshal(provDt, &pred))
