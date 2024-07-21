@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	aws_config "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/labels"
@@ -475,7 +475,7 @@ func (s3Client *s3Client) touch(ctx context.Context, key string) error {
 		Key:    &key,
 	})
 	if err != nil {
-		var nfe *types.NoSuchKey
+		var nfe *s3types.NoSuchKey
 		if errors.As(err, &nfe) {
 			return fmt.Errorf("object %s does not exist: %w", key, err)
 		}
@@ -495,7 +495,10 @@ func (s3Client *s3Client) touch(ctx context.Context, key string) error {
 		}
 
 		_, err := s3Client.CopyObject(ctx, cp)
-		return err
+		if err != nil {
+			return fmt.Errorf("failed to copy object %s: %w", key, err)
+		}
+		return nil
 	} else {
 		// If size is greater than 5GB, use multipart upload
 		// Initiate multipart upload
@@ -505,7 +508,7 @@ func (s3Client *s3Client) touch(ctx context.Context, key string) error {
 			Metadata: map[string]string{"updated-at": time.Now().String()},
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to initiate multipart upload for object %s: %w", key, err)
 		}
 
 		// Create a slice to hold the completed parts
@@ -528,9 +531,25 @@ func (s3Client *s3Client) touch(ctx context.Context, key string) error {
 				PartNumber:      &partNumber,
 				UploadId:        createOut.UploadId,
 				CopySourceRange: &copySourceRange,
+			}, func(o *s3.Options) {
+				// Increase retry attempts
+				o.Retryer = retry.NewStandard(func(so *retry.StandardOptions) {
+					so.MaxAttempts = 5
+				})
+				// Set custom timeouts
+				o.ClientLogMode = aws.LogRetries
 			})
 			if err != nil {
-				return err
+				// Abort the multipart upload in case of an error
+				_, abortErr := s3Client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+					Bucket:   &s3Client.bucket,
+					Key:      &key,
+					UploadId: createOut.UploadId,
+				})
+				if abortErr != nil {
+					return fmt.Errorf("failed to abort multipart upload for object %s after error: %w", key, abortErr)
+				}
+				return fmt.Errorf("failed to upload part %d for object %s: %w", partNumber, key, err)
 			}
 			completedParts = append(completedParts, s3types.CompletedPart{
 				ETag:       uploadPartCopyOutput.CopyPartResult.ETag,
